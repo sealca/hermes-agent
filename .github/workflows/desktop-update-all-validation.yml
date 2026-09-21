@@ -1,0 +1,26 @@
+name: Desktop update-all contribution validation
+
+on:
+  push:
+    branches: [contrib/desktop-update-all-validation]
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    if: github.repository == 'sealca/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Archive reviewed upstream source
+        run: |
+          git archive --format=tar.gz --output=hermes-source.tar.gz db1f3f4564eb0f1a4b75744064057f07d9a5c6e5
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hermes-source
+          path: hermes-source.tar.gz
+          retention-days: 1
