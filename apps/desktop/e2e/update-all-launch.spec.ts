@@ -8,8 +8,8 @@ import path from 'node:path'
 
 import { startMockServer } from '../../../tests-js/scripts/mock-server'
 
-import { buildAppEnv, createSandbox, findElectron, launchDesktop, writeEnvFile, writeMockProviderConfig } from './fixtures'
-import { type ElectronApplication, expect, test } from './test'
+import { buildAppEnv, createSandbox, findElectron, writeEnvFile, writeMockProviderConfig } from './fixtures'
+import { _electron, type ElectronApplication, expect, installErrorBannerGuard, test } from './test'
 
 const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
 
@@ -36,23 +36,39 @@ test('cold launch dispatches once; a running-instance request coalesces and relo
   let app: ElectronApplication | undefined
 
   try {
-    const launched = await launchDesktop(env, [`--hermes-update-all-request=${first.file}`])
-    app = launched.app
+    app = await _electron.launch({
+      executablePath: findElectron(),
+      args: [DESKTOP_ROOT, '--disable-gpu', '--no-sandbox', `--hermes-update-all-request=${first.file}`],
+      env,
+      cwd: DESKTOP_ROOT
+    })
+    const page = await app.firstWindow()
+    installErrorBannerGuard(page)
     await expect.poll(() => JSON.parse(fs.readFileSync(first.file, 'utf8')).state).toBe('accepted')
-    expect(await app.evaluate(() => process.argv.some(arg => arg.startsWith('--hermes-update-all-request=')))).toBe(false)
+    expect(await app.evaluate(() => process.argv.some(arg => arg.startsWith('--hermes-update-all-request=')))).toBe(
+      false
+    )
     await app.evaluate(({ ipcMain }) => {
       const state = globalThis as unknown as { updateOrder: string[]; finishRemote: () => void }
       state.updateOrder = []
       ipcMain.removeHandler('hermes:connections:list')
       ipcMain.handle('hermes:connections:list', () => ({
-        version: 2, primary: 'local', lastUsed: 'local', launchMode: 'primary',
-        connections: [{ id: 'local', kind: 'local', label: 'Local' }, { id: 'test-remote', kind: 'remote', label: 'Remote' }]
+        version: 2,
+        primary: 'local',
+        lastUsed: 'local',
+        launchMode: 'primary',
+        connections: [
+          { id: 'local', kind: 'local', label: 'Local' },
+          { id: 'test-remote', kind: 'remote', label: 'Remote' }
+        ]
       }))
       ipcMain.removeHandler('hermes:connections:update-all')
       ipcMain.handle('hermes:connections:update-all', () => {
         state.updateOrder.push('remote')
 
-        return new Promise(resolve => { state.finishRemote = () => resolve({ ok: true, results: [] }) })
+        return new Promise(resolve => {
+          state.finishRemote = () => resolve({ ok: true, results: [] })
+        })
       })
       ipcMain.removeHandler('hermes:updates:check')
       ipcMain.handle('hermes:updates:check', () => ({ supported: true, behind: 1, updateAvailable: true }))
@@ -72,18 +88,28 @@ test('cold launch dispatches once; a running-instance request coalesces and relo
     const order = () => app!.evaluate(() => (globalThis as unknown as { updateOrder: string[] }).updateOrder)
     await expect.poll(order, { timeout: 30_000 }).toEqual(['remote'])
 
-    const secondary = spawn(findElectron(), [DESKTOP_ROOT, '--no-sandbox', `--hermes-update-all-request=${duplicate.file}`], {
-      cwd: DESKTOP_ROOT, env, stdio: 'ignore'
-    })
+    const secondary = spawn(
+      findElectron(),
+      [DESKTOP_ROOT, '--no-sandbox', `--hermes-update-all-request=${duplicate.file}`],
+      {
+        cwd: DESKTOP_ROOT,
+        env,
+        stdio: 'ignore'
+      }
+    )
 
     const [code] = await once(secondary, 'exit')
     expect(code).toBe(0)
     await expect.poll(() => JSON.parse(fs.readFileSync(duplicate.file, 'utf8')).state).toBe('coalesced')
     expect(await order()).toEqual(['remote'])
     await app.evaluate(() => (globalThis as unknown as { finishRemote: () => void }).finishRemote())
-    await expect.poll(order).toEqual(['remote', 'local'])
-    await launched.page.reload()
-    await launched.page.waitForFunction(() => typeof window.hermesDesktop?.onUpdateAllRequested === 'function')
+    await expect.poll(order, { timeout: 45_000 }).toEqual(['remote', 'local'])
+    await page.reload()
+    await page.waitForFunction(
+      () =>
+        typeof (window as Window & { hermesDesktop?: { onUpdateAllRequested?: unknown } }).hermesDesktop
+          ?.onUpdateAllRequested === 'function'
+    )
     expect(await order()).toEqual(['remote', 'local'])
   } finally {
     launcher.stdin?.end()

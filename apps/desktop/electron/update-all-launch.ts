@@ -27,26 +27,39 @@ export function takeUpdateAllLaunchArg(argv: string[]): string | null {
 }
 
 function readRequest(file: string): LaunchRequest {
-  if (!path.isAbsolute(file) || path.basename(file) !== 'request.json' ||
-      !/^hermes-update-all-[\w-]+$/.test(path.basename(path.dirname(file)))) {
+  if (
+    !path.isAbsolute(file) ||
+    path.basename(file) !== 'request.json' ||
+    !/^hermes-update-all-[\w-]+$/.test(path.basename(path.dirname(file)))
+  ) {
     throw new Error('Invalid Desktop update request path')
   }
 
   const directory = fs.lstatSync(path.dirname(file))
   const stat = fs.lstatSync(file)
 
-  if (!directory.isDirectory() || !stat.isFile() || stat.size > 4096 ||
-      (process.platform !== 'win32' && (directory.uid !== process.getuid!() || (directory.mode & 0o077) !== 0))) {
+  if (
+    !directory.isDirectory() ||
+    !stat.isFile() ||
+    stat.size > 4096 ||
+    (process.platform !== 'win32' && (directory.uid !== process.getuid!() || (directory.mode & 0o077) !== 0))
+  ) {
     throw new Error('Desktop update request must be a private regular file')
   }
 
   const value = JSON.parse(fs.readFileSync(file, 'utf8')) as LaunchRequest
 
-  if (value.version !== 1 || !/^[a-f0-9]{32}$/.test(value.id) ||
-      !Number.isFinite(value.expires_at) || value.expires_at < Date.now() ||
-      value.expires_at > Date.now() + 60_000 || !Array.isArray(value.launcher_pids) ||
-      !value.launcher_pids.length || value.launcher_pids.length > 2 ||
-      !value.launcher_pids.every(pid => Number.isSafeInteger(pid) && pid > 0)) {
+  if (
+    value.version !== 1 ||
+    !/^[a-f0-9]{32}$/.test(value.id) ||
+    !Number.isFinite(value.expires_at) ||
+    value.expires_at < Date.now() ||
+    value.expires_at > Date.now() + 60_000 ||
+    !Array.isArray(value.launcher_pids) ||
+    !value.launcher_pids.length ||
+    value.launcher_pids.length > 2 ||
+    !value.launcher_pids.every(pid => Number.isSafeInteger(pid) && pid > 0)
+  ) {
     throw new Error('Invalid or expired Desktop update request')
   }
 

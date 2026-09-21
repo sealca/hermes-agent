@@ -9,7 +9,11 @@ import { applyEverythingUpdate, setUpdateOverlayOpen } from '@/store/updates'
  * never wait for that primary to become reachable before updating other hosts. */
 export async function updateAllFromLauncher(): Promise<void> {
   try {
-    const registry = await withTimeout(refreshConnectionsRegistry(), 10_000, translateNow('updates.everythingFanoutFailedTitle'))
+    const registry = await withTimeout(
+      refreshConnectionsRegistry(),
+      10_000,
+      translateNow('updates.everythingFanoutFailedTitle')
+    )
 
     if (!registry) {
       throw new Error(translateNow('updates.everythingFanoutFailedTitle'))

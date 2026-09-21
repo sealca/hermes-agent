@@ -13,7 +13,12 @@ afterEach(() => vi.useRealTimers())
 
 it('waits for the local registry then calls the existing all-target flow, not a local-only branch', async () => {
   let ready: (value: unknown) => void = () => undefined
-  mocks.registry.mockImplementation(() => new Promise(resolve => { ready = resolve }))
+  mocks.registry.mockImplementation(
+    () =>
+      new Promise(resolve => {
+        ready = resolve
+      })
+  )
   const request = updateAllFromLauncher()
   expect(mocks.apply).not.toHaveBeenCalled()
   ready({ connections: [{ id: 'local' }, { id: 'offline-vps' }] })
@@ -29,7 +34,12 @@ it('fails closed on missing/failed registry reads, including a late result after
   await updateAllFromLauncher()
   await updateAllFromLauncher()
   let ready: (value: unknown) => void = () => undefined
-  mocks.registry.mockImplementation(() => new Promise(resolve => { ready = resolve }))
+  mocks.registry.mockImplementation(
+    () =>
+      new Promise(resolve => {
+        ready = resolve
+      })
+  )
   const request = updateAllFromLauncher()
   await vi.advanceTimersByTimeAsync(10_001)
   await request

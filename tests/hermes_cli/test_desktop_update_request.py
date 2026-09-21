@@ -73,16 +73,16 @@ def test_real_process_handoff_exits_before_dispatch_and_times_out_old_apps(host,
 import json, pathlib, sys, time
 import psutil
 request = pathlib.Path(next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--hermes-update-all-request=')))
-value = json.loads(request.read_text())
+value = json.loads(request.read_text(encoding='utf-8'))
 def write(value):
     staged = request.with_suffix('.tmp')
-    staged.write_text(json.dumps(value))
+    staged.write_text(json.dumps(value), encoding='utf-8')
     staged.replace(request)
 write({**value, 'state': 'accepted'})
 while time.time() * 1000 < value['expires_at']:
-    current = json.loads(request.read_text())
+    current = json.loads(request.read_text(encoding='utf-8'))
     if current['state'] == 'committed' and not any(psutil.pid_exists(p) for p in value['launcher_pids']):
-        pathlib.Path(sys.argv[1]).write_text(json.dumps(current))
+        pathlib.Path(sys.argv[1]).write_text(json.dumps(current), encoding='utf-8')
         request.unlink()
         request.parent.rmdir()
         break
@@ -94,14 +94,14 @@ while time.time() * 1000 < value['expires_at']:
         f"sys.exit(launch_desktop_update_all([sys.executable, {str(app)!r}, {str(marker)!r}], "
         "cwd=Path.cwd(), env=dict(os.environ), timeout=5))"
     )
-    result = subprocess.run([sys.executable, "-c", launcher], capture_output=True, text=True, timeout=15)
+    result = subprocess.run([sys.executable, "-c", launcher], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
     assert result.returncode == 0, result.stderr
     assert "accepted" in result.stdout
     deadline = time.monotonic() + 5
     while not marker.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
     assert marker.exists(), "app must survive the launcher and consume only after its exit"
-    assert json.loads(marker.read_text())["state"] == "committed"
+    assert json.loads(marker.read_text(encoding="utf-8"))["state"] == "committed"
 
     # An older app ignores the switch. The request must time out without commit.
     old = (
@@ -110,6 +110,6 @@ while time.time() * 1000 < value['expires_at']:
         "sys.exit(launch_desktop_update_all([sys.executable, '-c', 'pass'], "
         "cwd=Path.cwd(), env=dict(os.environ), timeout=0.2))"
     )
-    result = subprocess.run([sys.executable, "-c", old], capture_output=True, text=True, timeout=10)
+    result = subprocess.run([sys.executable, "-c", old], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
     assert result.returncode == 1
     assert "no update was committed" in result.stderr
