@@ -77,7 +77,7 @@ index 6469c59..5f0e3e1 100644
 -    await launched.page.waitForFunction(() => typeof window.hermesDesktop?.onUpdateAllRequested === 'function')
 +    await expect.poll(order, { timeout: 45_000 }).toEqual(['remote', 'local'])
 +    await page.reload()
-+    await page.waitForFunction(() => typeof window.hermesDesktop?.onUpdateAllRequested === 'function')
++    await page.waitForFunction(() => typeof (window as Window & { hermesDesktop?: { onUpdateAllRequested?: unknown } }).hermesDesktop?.onUpdateAllRequested === 'function')
      expect(await order()).toEqual(['remote', 'local'])
    } finally {
      launcher.stdin?.end()
