@@ -81,7 +81,7 @@ jobs:
         run: |
           uv run --no-sync ruff check hermes_cli/desktop_update_request.py tests/hermes_cli/test_desktop_update_request.py
           scripts/run_tests.sh tests/hermes_cli/test_desktop_update_request.py tests/hermes_cli/test_gui_command.py tests/hermes_cli/test_desktop_startup_cost.py tests/hermes_cli/test_desktop_local_flag.py tests/hermes_cli/test_subcommands_batch.py -q 2>&1 | tee "$RUNNER_TEMP/evidence/python.log"
-          python scripts/check-windows-footguns.py --base db1f3f4564eb0f1a4b75744064057f07d9a5c6e5
+          python scripts/check-windows-footguns.py --diff db1f3f4564eb0f1a4b75744064057f07d9a5c6e5
       - name: Electron system dependencies
         run: |
           sudo apt-get update -qq
