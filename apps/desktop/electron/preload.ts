@@ -196,13 +196,16 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     onRequest: callback => {
       const channel = 'hermes:screenshot:request'
       const listener = (_event, requestId) => callback(requestId)
+
       if (ipcRenderer.listenerCount(channel) === 0) {
         ipcRenderer.send('hermes:screenshot:subscribe', true)
       }
+
       ipcRenderer.on(channel, listener)
 
       return () => {
         ipcRenderer.removeListener(channel, listener)
+
         if (ipcRenderer.listenerCount(channel) === 0) {
           ipcRenderer.send('hermes:screenshot:subscribe', false)
         }
@@ -471,6 +474,18 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     ipcRenderer.on('hermes:open-folder-requested', listener)
 
     return () => ipcRenderer.removeListener('hermes:open-folder-requested', listener)
+  },
+  onUpdateAllRequested: callback => {
+    const listener = (_event, id: string) => {
+      void Promise.resolve().then(callback)
+        .finally(() => ipcRenderer.invoke('hermes:update-all-complete', id))
+        .catch(error => console.error('[updates] update-all request failed:', error))
+    }
+
+    ipcRenderer.on('hermes:update-all-requested', listener)
+    void ipcRenderer.invoke('hermes:update-all-ready')
+
+    return () => ipcRenderer.removeListener('hermes:update-all-requested', listener)
   },
   onOpenUpdatesRequested: callback => {
     const listener = () => callback()
