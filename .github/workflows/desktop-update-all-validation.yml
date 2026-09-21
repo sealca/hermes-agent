@@ -20,41 +20,46 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Verify the reviewed patch and baseline
+      - name: Apply review fixes to the existing feature commit
         id: patch
         run: |
           mkdir -p "$RUNNER_TEMP/evidence"
-          cp .github/contribution/update-all.patch.gz.b64 "$RUNNER_TEMP/evidence/patch.gz.b64"
-          python - <<'PY'
-          import base64, gzip, hashlib, os
-          from pathlib import Path
-          evidence = Path(os.environ['RUNNER_TEMP']) / 'evidence'
-          encoded = (evidence / 'patch.gz.b64').read_text().replace('Aamp8kob/X6fPcNLWf78', 'Aamp8kob/X6fLOWf78')
-          patch = gzip.decompress(base64.b64decode(encoded))
-          assert hashlib.sha256(patch).hexdigest() == '3e65d52b559eefcfeab5a29120192c58f7ff6a8591bc6c74e1be3c89016d2139'
-          (evidence / 'input.patch').write_bytes(patch)
-          PY
-          git fetch origin db1f3f4564eb0f1a4b75744064057f07d9a5c6e5 --depth=1
-          git checkout --detach db1f3f4564eb0f1a4b75744064057f07d9a5c6e5
+          cp .github/contribution/update-all-followup.patch "$RUNNER_TEMP/evidence/input.patch"
+          git fetch origin 1c8292d3c9780092c511da81ca2b66ddf8397777 db1f3f4564eb0f1a4b75744064057f07d9a5c6e5 --depth=1
+          git checkout --detach 1c8292d3c9780092c511da81ca2b66ddf8397777
           git apply --check "$RUNNER_TEMP/evidence/input.patch"
           git apply "$RUNNER_TEMP/evidence/input.patch"
-          git add apps/desktop hermes_cli tests/hermes_cli/test_desktop_update_request.py website/docs
+          git add apps/desktop tests/hermes_cli
           git diff --cached --check
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 26
           cache: npm
-      - name: Install locked JavaScript dependencies
-        id: npm
-        run: npm ci
-      - name: Format only changed TypeScript files
+      - run: npm ci
+      - name: Format and lint changed TypeScript only
         id: format
         continue-on-error: true
         working-directory: apps/desktop
         run: |
-          git diff --cached --name-only --diff-filter=AM | grep -E '\.tsx?$' | sed 's|^apps/desktop/||' > "$RUNNER_TEMP/ts-files"
+          git diff db1f3f4564eb0f1a4b75744064057f07d9a5c6e5 --name-only --diff-filter=AM | grep -E '\.tsx?$' | sed 's|^apps/desktop/||' > "$RUNNER_TEMP/ts-files"
           xargs node ../../node_modules/eslint/bin/eslint.js --fix < "$RUNNER_TEMP/ts-files"
           xargs node ../../node_modules/prettier/bin/prettier.cjs --write < "$RUNNER_TEMP/ts-files"
+          xargs node ../../node_modules/eslint/bin/eslint.js < "$RUNNER_TEMP/ts-files"
+      - name: Prove the new cold-start regression fails before the fix
+        id: regression
+        continue-on-error: true
+        working-directory: apps/desktop
+        run: |
+          cp src/store/updates.ts "$RUNNER_TEMP/fixed-updates.ts"
+          trap 'cp "$RUNNER_TEMP/fixed-updates.ts" src/store/updates.ts' EXIT
+          git show 1c8292d3c9780092c511da81ca2b66ddf8397777:apps/desktop/src/store/updates.ts > src/store/updates.ts
+          set +e
+          node ../../node_modules/vitest/vitest.mjs run src/store/updates.test.ts -t 'cold launch waits' > "$RUNNER_TEMP/evidence/fail-before.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/evidence/fail-before.log"
+          test "$result" -ne 0
+          grep -q 'AssertionError' "$RUNNER_TEMP/evidence/fail-before.log"
       - name: Focused Desktop unit and regression tests
         id: vitest
         continue-on-error: true
@@ -69,42 +74,41 @@ jobs:
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: '0.9.28'
-      - name: Install locked Python dependencies
-        id: python
-        run: uv sync --locked --python 3.11 --extra all --extra dev
-      - name: Focused Python regression tests and lint
+      - run: uv sync --locked --python 3.11 --extra all --extra dev
+      - name: Python regression tests and Windows compatibility audit
         id: pytest
         continue-on-error: true
         run: |
-          uv run --no-sync ruff check --fix hermes_cli/desktop_update_request.py tests/hermes_cli/test_desktop_update_request.py
+          uv run --no-sync ruff check hermes_cli/desktop_update_request.py tests/hermes_cli/test_desktop_update_request.py
           scripts/run_tests.sh tests/hermes_cli/test_desktop_update_request.py tests/hermes_cli/test_gui_command.py tests/hermes_cli/test_desktop_startup_cost.py tests/hermes_cli/test_desktop_local_flag.py tests/hermes_cli/test_subcommands_batch.py -q 2>&1 | tee "$RUNNER_TEMP/evidence/python.log"
-          python scripts/check-windows-footguns.py
+          python scripts/check-windows-footguns.py --base db1f3f4564eb0f1a4b75744064057f07d9a5c6e5
       - name: Electron system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq xvfb libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64
-      - name: Real Electron launch and single-instance integration test
+      - name: Real Electron integration, repeated without retries
         id: e2e
         continue-on-error: true
         working-directory: apps/desktop
         run: |
           npm run build 2>&1 | tee "$RUNNER_TEMP/evidence/build.log"
-          xvfb-run -a --server-args='-screen 0 1280x1024x24' node ../../node_modules/@playwright/test/cli.js test e2e/update-all-launch.spec.ts --workers=1 --reporter=list 2>&1 | tee "$RUNNER_TEMP/evidence/e2e.log"
-      - name: Export candidate and honest test outcomes
+          xvfb-run -a --server-args='-screen 0 1280x1024x24' node ../../node_modules/@playwright/test/cli.js test e2e/update-all-launch.spec.ts --workers=1 --reporter=list --retries=0 --repeat-each=3 2>&1 | tee "$RUNNER_TEMP/evidence/e2e.log"
+      - name: Export the candidate and measured outcomes
         id: candidate
         if: always() && steps.patch.outcome == 'success'
         env:
           FORMAT: ${{ steps.format.outcome }}
+          REGRESSION: ${{ steps.regression.outcome }}
           VITEST: ${{ steps.vitest.outcome }}
           TYPES: ${{ steps.types.outcome }}
           PYTEST: ${{ steps.pytest.outcome }}
           E2E: ${{ steps.e2e.outcome }}
         run: |
-          git add apps/desktop hermes_cli tests/hermes_cli/test_desktop_update_request.py website/docs
+          git add apps/desktop tests/hermes_cli
           git diff --cached --check
           git diff --cached --binary > "$RUNNER_TEMP/evidence/candidate.patch"
-          git diff --cached --stat > "$RUNNER_TEMP/evidence/diff-stat.txt"
-          printf 'format=%s\nvitest=%s\ntypes=%s\npython=%s\ne2e=%s\n' "$FORMAT" "$VITEST" "$TYPES" "$PYTEST" "$E2E" > "$RUNNER_TEMP/evidence/outcomes.txt"
+          git diff --cached db1f3f4564eb0f1a4b75744064057f07d9a5c6e5 --stat > "$RUNNER_TEMP/evidence/diff-stat.txt"
+          printf 'format=%s\nregression=%s\nvitest=%s\ntypes=%s\npython=%s\ne2e=%s\n' "$FORMAT" "$REGRESSION" "$VITEST" "$TYPES" "$PYTEST" "$E2E" > "$RUNNER_TEMP/evidence/outcomes.txt"
           echo 'ready=true' >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
@@ -113,16 +117,17 @@ jobs:
           path: ${{ runner.temp }}/evidence
           retention-days: 7
       - name: Require successful validation
-        if: always() && steps.patch.outcome == 'success'
+        if: always()
         run: |
           test '${{ steps.format.outcome }}' = success
+          test '${{ steps.regression.outcome }}' = success
           test '${{ steps.vitest.outcome }}' = success
           test '${{ steps.types.outcome }}' = success
           test '${{ steps.pytest.outcome }}' = success
           test '${{ steps.e2e.outcome }}' = success
   publish:
     needs: prepare
-    if: always() && needs.prepare.outputs.candidate == 'true' && github.repository == 'sealca/hermes-agent'
+    if: needs.prepare.outputs.candidate == 'true' && github.repository == 'sealca/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -132,31 +137,27 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: db1f3f4564eb0f1a4b75744064057f07d9a5c6e5
+          ref: 1c8292d3c9780092c511da81ca2b66ddf8397777
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: desktop-update-all-evidence
           path: ${{ runner.temp }}/evidence
-      - name: Publish only the feature patch, never the validation workflow
+      - name: Fast-forward only the reviewed feature branch
         id: commit
         shell: bash
         run: |
-          if git ls-remote --exit-code origin refs/heads/feat/desktop-update-all; then
-            echo 'Feature branch already exists; refusing to overwrite it.' >&2
-            exit 1
-          fi
+          test "$(git ls-remote origin refs/heads/feat/desktop-update-all | cut -f1)" = 1c8292d3c9780092c511da81ca2b66ddf8397777
           git apply --check "$RUNNER_TEMP/evidence/candidate.patch"
           git apply "$RUNNER_TEMP/evidence/candidate.patch"
-          git add apps/desktop hermes_cli tests/hermes_cli/test_desktop_update_request.py website/docs
+          git add apps/desktop tests/hermes_cli
           git diff --cached --check
           git config user.name Sealcadev
           git config user.email 100358515+sealca@users.noreply.github.com
-          git commit -m 'feat(desktop): add one-shot update-all launch action' -m 'Refs NousResearch/hermes-agent#118098. Reuse Desktop update orchestration without rebuilding or leaving a Python launcher holding the Windows venv.'
+          git commit -m 'fix(desktop): await cold-start checks before update-all' -m 'Fix the race reproduced by the real Electron launch test, validate single-instance metadata, and keep cross-platform test I/O UTF-8 explicit.'
           git push origin HEAD:refs/heads/feat/desktop-update-all
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   native-python:
     needs: publish
-    if: always() && needs.publish.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -175,5 +176,4 @@ jobs:
         with:
           version: '0.9.28'
       - run: uv sync --locked --python 3.11 --extra all --extra dev
-      - name: Test launch lifecycle on the actual OS
-        run: scripts/run_tests.sh tests/hermes_cli/test_desktop_update_request.py -q
+      - run: scripts/run_tests.sh tests/hermes_cli/test_desktop_update_request.py -q

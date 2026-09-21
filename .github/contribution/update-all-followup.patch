@@ -1,0 +1,239 @@
+diff --git a/apps/desktop/e2e/fixtures.ts b/apps/desktop/e2e/fixtures.ts
+index de42d99..134e957 100644
+--- a/apps/desktop/e2e/fixtures.ts
++++ b/apps/desktop/e2e/fixtures.ts
+@@ -26,9 +26,8 @@ import * as path from 'node:path'
+ 
+ import { _electron, type ElectronApplication, type Page } from '@playwright/test'
+ 
+-import { type MockServerOptions, startMockServer } from '../../../tests-js/scripts/mock-server'
+-
+ import { resolveElectronBinary } from './electron-binary'
++import { startMockServer, type MockServerOptions } from '../../../tests-js/scripts/mock-server'
+ import { installErrorBannerGuard } from './test'
+ 
+ const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
+@@ -328,7 +327,6 @@ export function findElectron(): string {
+  */
+ export async function launchDesktop(
+   env: Record<string, string>,
+-  extraArgs: string[] = [],
+ ): Promise<{ app: ElectronApplication; page: Page }> {
+   assertDistBuilt()
+ 
+@@ -342,7 +340,6 @@ export async function launchDesktop(
+       DESKTOP_ROOT, // `electron .` — the `.` is the desktop package dir
+       '--disable-gpu',
+       '--no-sandbox',
+-      ...extraArgs,
+     ],
+     env,
+     cwd: DESKTOP_ROOT,
+@@ -646,7 +643,6 @@ export async function waitForAppReady(fixture: MockBackendFixture | NoProviderFi
+       // `position: fixed; inset: 0`. If the hit element or an ancestor
+       // is a full-viewport fixed overlay, we're still covered.
+       let node: Element | null = el
+-
+       while (node) {
+         const cs = window.getComputedStyle(node)
+ 
+diff --git a/apps/desktop/e2e/update-all-launch.spec.ts b/apps/desktop/e2e/update-all-launch.spec.ts
+index 6469c59..5f0e3e1 100644
+--- a/apps/desktop/e2e/update-all-launch.spec.ts
++++ b/apps/desktop/e2e/update-all-launch.spec.ts
+@@ -8,8 +8,8 @@ import path from 'node:path'
+ 
+ import { startMockServer } from '../../../tests-js/scripts/mock-server'
+ 
+-import { buildAppEnv, createSandbox, findElectron, launchDesktop, writeEnvFile, writeMockProviderConfig } from './fixtures'
+-import { type ElectronApplication, expect, test } from './test'
++import { buildAppEnv, createSandbox, findElectron, writeEnvFile, writeMockProviderConfig } from './fixtures'
++import { _electron, type ElectronApplication, expect, installErrorBannerGuard, test } from './test'
+ 
+ const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
+ 
+@@ -36,8 +36,13 @@ test('cold launch dispatches once; a running-instance request coalesces and relo
+   let app: ElectronApplication | undefined
+ 
+   try {
+-    const launched = await launchDesktop(env, [`--hermes-update-all-request=${first.file}`])
+-    app = launched.app
++    app = await _electron.launch({
++      executablePath: findElectron(),
++      args: [DESKTOP_ROOT, '--disable-gpu', '--no-sandbox', `--hermes-update-all-request=${first.file}`],
++      env, cwd: DESKTOP_ROOT
++    })
++    const page = await app.firstWindow()
++    installErrorBannerGuard(page)
+     await expect.poll(() => JSON.parse(fs.readFileSync(first.file, 'utf8')).state).toBe('accepted')
+     expect(await app.evaluate(() => process.argv.some(arg => arg.startsWith('--hermes-update-all-request=')))).toBe(false)
+     await app.evaluate(({ ipcMain }) => {
+@@ -81,9 +86,9 @@ test('cold launch dispatches once; a running-instance request coalesces and relo
+     await expect.poll(() => JSON.parse(fs.readFileSync(duplicate.file, 'utf8')).state).toBe('coalesced')
+     expect(await order()).toEqual(['remote'])
+     await app.evaluate(() => (globalThis as unknown as { finishRemote: () => void }).finishRemote())
+-    await expect.poll(order).toEqual(['remote', 'local'])
+-    await launched.page.reload()
+-    await launched.page.waitForFunction(() => typeof window.hermesDesktop?.onUpdateAllRequested === 'function')
++    await expect.poll(order, { timeout: 45_000 }).toEqual(['remote', 'local'])
++    await page.reload()
++    await page.waitForFunction(() => typeof window.hermesDesktop?.onUpdateAllRequested === 'function')
+     expect(await order()).toEqual(['remote', 'local'])
+   } finally {
+     launcher.stdin?.end()
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 980cd72..5e699d4 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -15106,6 +15106,7 @@ function createWindow() {
+   }
+ 
+   mainWindow.webContents.on('did-start-loading', () => updateAllLaunch.rendererGone())
++  mainWindow.webContents.on('render-process-gone', () => updateAllLaunch.rendererGone())
+   bindWindowChromeEvents(mainWindow, sendWindowStateChanged)
+ 
+   // Reopen where the user left off. close is the backstop, flushed
+@@ -18554,7 +18555,8 @@ if (!isPrimaryInstance) {
+   app.exit(0)
+ } else {
+   app.on('second-instance', (_event, argv, _cwd, additionalData) => {
+-    const updateRequest = typeof additionalData?.updateAllRequest === 'string'
++    const updateRequest = additionalData && typeof additionalData === 'object' &&
++      'updateAllRequest' in additionalData && typeof additionalData.updateAllRequest === 'string'
+       ? additionalData.updateAllRequest
+       : takeUpdateAllLaunchArg(argv)
+ 
+diff --git a/apps/desktop/src/store/updates.test.ts b/apps/desktop/src/store/updates.test.ts
+index 92d1723..fcf0411 100644
+--- a/apps/desktop/src/store/updates.test.ts
++++ b/apps/desktop/src/store/updates.test.ts
+@@ -82,6 +82,7 @@ vi.mock('@/store/gateway-reconnect', () => ({
+ const {
+   maybeNotifyUpdateAvailable,
+   checkBackendUpdates,
++  checkUpdates,
+   $backendUpdateStatus,
+   applyBackendUpdate,
+   $backendUpdateApply,
+@@ -561,6 +562,33 @@ describe('applyEverythingUpdate', () => {
+     delete (globalThis as unknown as { window?: unknown }).window
+   })
+ 
++  it('cold launch waits for a passive client check, then forces a fresh check before applying', async () => {
++    setRemote(false)
++    $mockConnectionsRegistry.set(registryOf(['local']))
++    let release: (value: DesktopUpdateStatus) => void = () => undefined
++    checkClientMock.mockImplementationOnce(() => new Promise(resolve => { release = resolve }))
++      .mockResolvedValueOnce(status({ behind: 3, updateAvailable: true }))
++    const passive = checkUpdates()
++    const update = applyEverythingUpdate()
++    await Promise.resolve()
++    release(status({ behind: 0, updateAvailable: false }))
++    await Promise.all([passive, update])
++    expect(checkClientMock.mock.calls.map(([options]) => options.force)).toEqual([false, true])
++    expect(applyClientMock).toHaveBeenCalledTimes(1)
++  })
++
++  it('coalesces simultaneous forced client checks without preventing a later retry', async () => {
++    let release: (value: DesktopUpdateStatus) => void = () => undefined
++    checkClientMock.mockImplementationOnce(() => new Promise(resolve => { release = resolve }))
++    const first = checkUpdates({ force: true })
++    const second = checkUpdates({ force: true })
++    expect(second).toBe(first)
++    release(status({ behind: 0 }))
++    await Promise.all([first, second])
++    await checkUpdates({ force: true })
++    expect(checkClientMock).toHaveBeenCalledTimes(2)
++  })
++
+   it('gates on multiple targets: remote mode OR a multi-connection registry', () => {
+     setRemote(false)
+     $mockConnectionsRegistry.set(null)
+diff --git a/apps/desktop/src/store/updates.ts b/apps/desktop/src/store/updates.ts
+index 06fedcc..7332122 100644
+--- a/apps/desktop/src/store/updates.ts
++++ b/apps/desktop/src/store/updates.ts
+@@ -438,10 +438,31 @@ export async function checkBackendUpdates({
+   }
+ }
+ 
+-export async function checkUpdates({ force = false }: UpdateCheckOptions = {}): Promise<DesktopUpdateStatus | null> {
++let clientUpdateCheck: { force: boolean; promise: Promise<DesktopUpdateStatus | null> } | null = null
++
++export function checkUpdates({ force = false }: UpdateCheckOptions = {}): Promise<DesktopUpdateStatus | null> {
++  if (clientUpdateCheck) {
++    const current = clientUpdateCheck
++    // A launch-time apply must not mistake an unfinished passive check's empty
++    // cache for "already current". A forced caller also needs a cache-busting
++    // check after a passive one; concurrent forced callers share that work.
++    return force && !current.force
++      ? current.promise.then(() => checkUpdates({ force: true }))
++      : current.promise
++  }
++
++  const promise = runClientUpdateCheck({ force }).finally(() => {
++    clientUpdateCheck = null
++  })
++  clientUpdateCheck = { force, promise }
++
++  return promise
++}
++
++async function runClientUpdateCheck({ force = false }: UpdateCheckOptions): Promise<DesktopUpdateStatus | null> {
+   const bridge = window.hermesDesktop?.updates
+ 
+-  if (!bridge || $updateChecking.get()) {
++  if (!bridge) {
+     return $updateStatus.get()
+   }
+ 
+diff --git a/tests/hermes_cli/test_desktop_update_request.py b/tests/hermes_cli/test_desktop_update_request.py
+index b88d1d8..8374f61 100644
+--- a/tests/hermes_cli/test_desktop_update_request.py
++++ b/tests/hermes_cli/test_desktop_update_request.py
+@@ -73,16 +73,16 @@ def test_real_process_handoff_exits_before_dispatch_and_times_out_old_apps(host,
+ import json, pathlib, sys, time
+ import psutil
+ request = pathlib.Path(next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--hermes-update-all-request=')))
+-value = json.loads(request.read_text())
++value = json.loads(request.read_text(encoding='utf-8'))
+ def write(value):
+     staged = request.with_suffix('.tmp')
+-    staged.write_text(json.dumps(value))
++    staged.write_text(json.dumps(value), encoding='utf-8')
+     staged.replace(request)
+ write({**value, 'state': 'accepted'})
+ while time.time() * 1000 < value['expires_at']:
+-    current = json.loads(request.read_text())
++    current = json.loads(request.read_text(encoding='utf-8'))
+     if current['state'] == 'committed' and not any(psutil.pid_exists(p) for p in value['launcher_pids']):
+-        pathlib.Path(sys.argv[1]).write_text(json.dumps(current))
++        pathlib.Path(sys.argv[1]).write_text(json.dumps(current), encoding='utf-8')
+         request.unlink()
+         request.parent.rmdir()
+         break
+@@ -94,14 +94,14 @@ while time.time() * 1000 < value['expires_at']:
+         f"sys.exit(launch_desktop_update_all([sys.executable, {str(app)!r}, {str(marker)!r}], "
+         "cwd=Path.cwd(), env=dict(os.environ), timeout=5))"
+     )
+-    result = subprocess.run([sys.executable, "-c", launcher], capture_output=True, text=True, timeout=15)
++    result = subprocess.run([sys.executable, "-c", launcher], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+     assert result.returncode == 0, result.stderr
+     assert "accepted" in result.stdout
+     deadline = time.monotonic() + 5
+     while not marker.exists() and time.monotonic() < deadline:
+         time.sleep(0.05)
+     assert marker.exists(), "app must survive the launcher and consume only after its exit"
+-    assert json.loads(marker.read_text())["state"] == "committed"
++    assert json.loads(marker.read_text(encoding="utf-8"))["state"] == "committed"
+ 
+     # An older app ignores the switch. The request must time out without commit.
+     old = (
+@@ -110,6 +110,6 @@ while time.time() * 1000 < value['expires_at']:
+         "sys.exit(launch_desktop_update_all([sys.executable, '-c', 'pass'], "
+         "cwd=Path.cwd(), env=dict(os.environ), timeout=0.2))"
+     )
+-    result = subprocess.run([sys.executable, "-c", old], capture_output=True, text=True, timeout=10)
++    result = subprocess.run([sys.executable, "-c", old], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+     assert result.returncode == 1
+     assert "no update was committed" in result.stderr
