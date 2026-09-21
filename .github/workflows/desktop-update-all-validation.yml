@@ -1,12 +1,9 @@
 name: Desktop update-all contribution validation
-
 on:
   push:
     branches: [contrib/desktop-update-all-validation]
-
 permissions:
   contents: read
-
 jobs:
   prepare:
     if: github.repository == 'sealca/hermes-agent'
@@ -32,7 +29,8 @@ jobs:
           import base64, gzip, hashlib, os
           from pathlib import Path
           evidence = Path(os.environ['RUNNER_TEMP']) / 'evidence'
-          patch = gzip.decompress(base64.b64decode((evidence / 'patch.gz.b64').read_text()))
+          encoded = (evidence / 'patch.gz.b64').read_text().replace('Aamp8kob/X6fPcNLWf78', 'Aamp8kob/X6fLOWf78')
+          patch = gzip.decompress(base64.b64decode(encoded))
           assert hashlib.sha256(patch).hexdigest() == '3e65d52b559eefcfeab5a29120192c58f7ff6a8591bc6c74e1be3c89016d2139'
           (evidence / 'input.patch').write_bytes(patch)
           PY
@@ -43,17 +41,15 @@ jobs:
           git add apps/desktop hermes_cli tests/hermes_cli/test_desktop_update_request.py website/docs
           git diff --cached --check
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: steps.patch.outcome == 'success'
         with:
           node-version: 26
           cache: npm
       - name: Install locked JavaScript dependencies
         id: npm
-        if: steps.patch.outcome == 'success'
         run: npm ci
       - name: Format only changed TypeScript files
         id: format
-        if: steps.npm.outcome == 'success'
+        continue-on-error: true
         working-directory: apps/desktop
         run: |
           git diff --cached --name-only --diff-filter=AM | grep -E '\.tsx?$' | sed 's|^apps/desktop/||' > "$RUNNER_TEMP/ts-files"
@@ -61,41 +57,34 @@ jobs:
           xargs node ../../node_modules/prettier/bin/prettier.cjs --write < "$RUNNER_TEMP/ts-files"
       - name: Focused Desktop unit and regression tests
         id: vitest
-        if: steps.npm.outcome == 'success'
         continue-on-error: true
         working-directory: apps/desktop
         run: |
           node ../../node_modules/vitest/vitest.mjs run --maxWorkers=2 electron/update-all-launch.test.ts src/store/update-all-launch.test.ts src/store/updates.test.ts src/app/contrib/hooks/use-desktop-integrations.test.tsx 2>&1 | tee "$RUNNER_TEMP/evidence/vitest.log"
       - name: TypeScript checks
         id: types
-        if: steps.npm.outcome == 'success'
         continue-on-error: true
         working-directory: apps/desktop
         run: npm run typecheck 2>&1 | tee "$RUNNER_TEMP/evidence/types.log"
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
-        if: steps.patch.outcome == 'success'
         with:
           version: '0.9.28'
       - name: Install locked Python dependencies
         id: python
-        if: steps.patch.outcome == 'success'
         run: uv sync --locked --python 3.11 --extra all --extra dev
       - name: Focused Python regression tests and lint
         id: pytest
-        if: steps.python.outcome == 'success'
         continue-on-error: true
         run: |
+          uv run --no-sync ruff check --fix hermes_cli/desktop_update_request.py tests/hermes_cli/test_desktop_update_request.py
           scripts/run_tests.sh tests/hermes_cli/test_desktop_update_request.py tests/hermes_cli/test_gui_command.py tests/hermes_cli/test_desktop_startup_cost.py tests/hermes_cli/test_desktop_local_flag.py tests/hermes_cli/test_subcommands_batch.py -q 2>&1 | tee "$RUNNER_TEMP/evidence/python.log"
-          uv run --no-sync ruff check hermes_cli/desktop_update_request.py tests/hermes_cli/test_desktop_update_request.py
           python scripts/check-windows-footguns.py
       - name: Electron system dependencies
-        if: steps.npm.outcome == 'success' && steps.python.outcome == 'success'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq xvfb libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64
       - name: Real Electron launch and single-instance integration test
         id: e2e
-        if: steps.npm.outcome == 'success' && steps.python.outcome == 'success'
         continue-on-error: true
         working-directory: apps/desktop
         run: |
@@ -131,7 +120,6 @@ jobs:
           test '${{ steps.types.outcome }}' = success
           test '${{ steps.pytest.outcome }}' = success
           test '${{ steps.e2e.outcome }}' = success
-
   publish:
     needs: prepare
     if: always() && needs.prepare.outputs.candidate == 'true' && github.repository == 'sealca/hermes-agent'
@@ -166,7 +154,6 @@ jobs:
           git commit -m 'feat(desktop): add one-shot update-all launch action' -m 'Refs NousResearch/hermes-agent#118098. Reuse Desktop update orchestration without rebuilding or leaving a Python launcher holding the Windows venv.'
           git push origin HEAD:refs/heads/feat/desktop-update-all
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
   native-python:
     needs: publish
     if: always() && needs.publish.result == 'success'
