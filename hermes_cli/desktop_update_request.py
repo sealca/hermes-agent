@@ -54,31 +54,42 @@ def launch_desktop_update_all(command: list[str], *, cwd: Path, env: dict,
     }
     try:
         _write_request(request, data)
-        subprocess.Popen(
+        # Fire-and-forget is intentional: Desktop waits for launcher_pids to
+        # disappear before updating, so waiting here would keep the venv locked
+        # and deadlock the handoff. Explicitly close inherited descriptors and
+        # opportunistically poll below so a short-lived secondary instance is
+        # still reaped when it exits during the acknowledgement window.
+        desktop = subprocess.Popen(
             [*command, f"{UPDATE_ALL_REQUEST_SWITCH}{request}"],
             cwd=cwd, env=env, stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=sys.platform != "win32",
             creationflags=windows_detach_flags(),
+            close_fds=True,
         )
         deadline = time.monotonic() + timeout
+        poll_delay = 0.05
         while time.monotonic() < deadline:
             response = json.loads(request.read_text(encoding="utf-8"))
             if response.get("id") != data["id"]:
                 raise ValueError("Desktop returned an unrelated update acknowledgement")
             if response.get("state") == "interrupted":
+                desktop.poll()
                 print("The previous update lost its Desktop window. Check its outcome in Desktop, "
                       "then restart Desktop before retrying; no new update was started.", file=sys.stderr)
                 return 1
             if response.get("state") == "coalesced":
+                desktop.poll()
                 print("An update-all request is already pending or running in Hermes Desktop.")
                 return 0
             if response.get("state") == "accepted":
                 _write_request(request, {**data, "state": "committed"})
                 committed = True
+                desktop.poll()
                 print("Hermes Desktop accepted the update request. See Desktop for progress and safety prompts.")
                 return 0
-            time.sleep(0.05)
+            time.sleep(poll_delay)
+            poll_delay = min(poll_delay * 2, 0.25)
         print("Desktop did not acknowledge the update request; no update was committed. "
               "Quit any older Desktop instance and launch a current build with `hermes desktop`, "
               "then retry.", file=sys.stderr)
