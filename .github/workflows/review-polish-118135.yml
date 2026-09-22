@@ -1,4 +1,4 @@
-name: Rebase and validate 118135
+name: Sync, rebase and validate 118135
 
 on:
   push:
@@ -13,19 +13,24 @@ jobs:
     timeout-minutes: 30
     env:
       NODE_OPTIONS: --max-old-space-size=6144
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
 
-      - name: Rebase feature commits onto current upstream main
+      - name: Sync fork main from upstream
+        shell: bash
+        run: |
+          gh api --method POST repos/${GITHUB_REPOSITORY}/merge-upstream -f branch=main
+          git fetch origin main
+
+      - name: Rebase feature commits onto synced main
         shell: bash
         run: |
           git config user.name "Sealcadev"
           git config user.email "100358515+sealca@users.noreply.github.com"
-          git remote add upstream https://github.com/NousResearch/hermes-agent.git
-          git fetch upstream main
-          git checkout --detach upstream/main
+          git checkout --detach origin/main
 
           set +e
           git cherry-pick 1c8292d3c9780092c511da81ca2b66ddf8397777
@@ -73,16 +78,11 @@ jobs:
             expected="$(printf '%s\n' apps/desktop/electron/main.ts apps/desktop/electron/preload.ts | sort)"
             test "$unresolved" = "$expected"
 
-            # Both conflicts are upstream churn around code this commit also
-            # formatted. Keep current main, then replay only the two semantic
-            # fixes from the commit.
             git checkout --ours apps/desktop/electron/main.ts apps/desktop/electron/preload.ts
             python - <<'PY'
           from pathlib import Path
-
           path = Path("apps/desktop/electron/main.ts")
           text = path.read_text(encoding="utf-8")
-
           loading = "  mainWindow.webContents.on('did-start-loading', () => updateAllLaunch.rendererGone())\n"
           gone = "  mainWindow.webContents.on('render-process-gone', () => updateAllLaunch.rendererGone())\n"
           if gone not in text:
@@ -106,7 +106,6 @@ jobs:
               text = text.replace(old, new, 1)
           elif "'updateAllRequest' in additionalData" not in text:
               raise SystemExit("second-instance update request guard moved")
-
           path.write_text(text, encoding="utf-8")
           PY
             git add apps/desktop/electron/main.ts apps/desktop/electron/preload.ts
@@ -114,8 +113,7 @@ jobs:
           fi
 
           git cherry-pick 919c5368037e605560f4d0996cc605ce31081800
-          git diff upstream/main...HEAD --check
-          echo "REBASING_ON=$(git rev-parse upstream/main)" >> "$GITHUB_ENV"
+          git diff origin/main...HEAD --check
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
