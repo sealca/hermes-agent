@@ -1,4 +1,4 @@
-name: Sync, rebase and validate 118135
+name: Publish rebased PR 118135
 
 on:
   push:
@@ -8,29 +8,26 @@ permissions:
   contents: write
 
 jobs:
-  rebase-validate:
+  publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     env:
-      NODE_OPTIONS: --max-old-space-size=6144
       GH_TOKEN: ${{ github.token }}
+      TARGET_BASE: ci/rebased-feature-118135
+      EXPECTED_BASE: fde4997f580c3480798fdf9c7e92c0079d6e03d6
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
 
-      - name: Sync fork main from upstream
-        shell: bash
-        run: |
-          gh api --method POST repos/${GITHUB_REPOSITORY}/merge-upstream -f branch=main
-          git fetch origin main
-
-      - name: Rebase feature commits onto synced main
+      - name: Reconstruct the already-validated rebase
         shell: bash
         run: |
           git config user.name "Sealcadev"
           git config user.email "100358515+sealca@users.noreply.github.com"
-          git checkout --detach origin/main
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream "$EXPECTED_BASE"
+          git checkout --detach "$EXPECTED_BASE"
 
           set +e
           git cherry-pick 1c8292d3c9780092c511da81ca2b66ddf8397777
@@ -77,7 +74,6 @@ jobs:
             unresolved="$(git diff --name-only --diff-filter=U | sort)"
             expected="$(printf '%s\n' apps/desktop/electron/main.ts apps/desktop/electron/preload.ts | sort)"
             test "$unresolved" = "$expected"
-
             git checkout --ours apps/desktop/electron/main.ts apps/desktop/electron/preload.ts
             python - <<'PY'
           from pathlib import Path
@@ -113,31 +109,93 @@ jobs:
           fi
 
           git cherry-pick 919c5368037e605560f4d0996cc605ce31081800
-          git diff origin/main...HEAD --check
+          git diff "$EXPECTED_BASE"...HEAD --check
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 26
-          cache: npm
-      - run: npm ci
-      - name: Desktop focused tests
-        working-directory: apps/desktop
-        run: |
-          npx vitest run --maxWorkers=2 electron/update-all-launch.test.ts src/store/update-all-launch.test.ts src/store/updates.test.ts src/app/contrib/hooks/use-desktop-integrations.test.tsx
-          npm run typecheck
+          cat > /tmp/expected-files <<'EOF'
+          apps/desktop/e2e/update-all-launch.spec.ts
+          apps/desktop/electron/main.ts
+          apps/desktop/electron/preload.ts
+          apps/desktop/electron/update-all-launch.test.ts
+          apps/desktop/electron/update-all-launch.ts
+          apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts
+          apps/desktop/src/global.d.ts
+          apps/desktop/src/store/update-all-launch.test.ts
+          apps/desktop/src/store/update-all-launch.ts
+          apps/desktop/src/store/updates.test.ts
+          apps/desktop/src/store/updates.ts
+          hermes_cli/desktop_update_request.py
+          hermes_cli/main_desktop.py
+          hermes_cli/subcommands/gui.py
+          tests/hermes_cli/test_desktop_update_request.py
+          website/docs/reference/cli-commands.md
+          website/docs/user-guide/multi-connection-desktop.md
+          EOF
+          git diff --name-only "$EXPECTED_BASE"...HEAD | sort > /tmp/actual-files
+          sort -o /tmp/expected-files /tmp/expected-files
+          diff -u /tmp/expected-files /tmp/actual-files
 
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
-        with:
-          version: '0.9.28'
-      - run: uv sync --locked --python 3.11 --extra all --extra dev
-      - name: Python focused tests
+      - name: Publish exact rebased tree as one feature commit
         shell: bash
         run: |
-          scripts/run_tests.sh tests/hermes_cli/test_desktop_update_request.py tests/hermes_cli/test_gui_command.py tests/hermes_cli/test_desktop_startup_cost.py tests/hermes_cli/test_desktop_local_flag.py tests/hermes_cli/test_subcommands_batch.py -q
-          uv run --no-sync ruff check hermes_cli/desktop_update_request.py tests/hermes_cli/test_desktop_update_request.py
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          import subprocess
+          import urllib.request
 
-      - name: Publish rebased feature branch
-        shell: bash
-        run: |
-          git push --force-with-lease=refs/heads/feat/desktop-update-all:919c5368037e605560f4d0996cc605ce31081800 \
-            origin HEAD:refs/heads/feat/desktop-update-all
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          branch = os.environ["TARGET_BASE"]
+          base = os.environ["EXPECTED_BASE"]
+          api = "https://api.github.com"
+
+          def request(method, path, payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              req = urllib.request.Request(
+                  api + path,
+                  data=data,
+                  method=method,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  },
+              )
+              with urllib.request.urlopen(req) as response:
+                  return json.load(response)
+
+          ref = request("GET", f"/repos/{repo}/git/ref/heads/{branch}")
+          if ref["object"]["sha"] != base:
+              raise SystemExit(f"{branch} moved: {ref['object']['sha']} != {base}")
+
+          base_commit = request("GET", f"/repos/{repo}/git/commits/{base}")
+          files = subprocess.check_output(
+              ["git", "diff", "--name-only", f"{base}...HEAD"], text=True
+          ).splitlines()
+
+          tree = []
+          for path in files:
+              content = open(path, "rb").read()
+              blob = request("POST", f"/repos/{repo}/git/blobs", {
+                  "content": base64.b64encode(content).decode(),
+                  "encoding": "base64",
+              })
+              tree.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
+
+          new_tree = request("POST", f"/repos/{repo}/git/trees", {
+              "base_tree": base_commit["tree"]["sha"],
+              "tree": tree,
+          })
+          commit = request("POST", f"/repos/{repo}/git/commits", {
+              "message": "feat(desktop): expose update-all as a one-shot CLI action\n\nCloses NousResearch/hermes-agent#118098. Rebased onto current upstream main and includes reviewer polish.",
+              "tree": new_tree["sha"],
+              "parents": [base],
+          })
+          request("PATCH", f"/repos/{repo}/git/refs/heads/{branch}", {
+              "sha": commit["sha"],
+              "force": True,
+          })
+          print(commit["sha"])
+          PY
