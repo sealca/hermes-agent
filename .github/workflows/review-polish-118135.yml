@@ -17,6 +17,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+
       - name: Rebase feature commits onto current upstream main
         shell: bash
         run: |
@@ -28,9 +29,9 @@ jobs:
 
           set +e
           git cherry-pick 1c8292d3c9780092c511da81ca2b66ddf8397777
-          rc=$?
+          first_rc=$?
           set -e
-          if [ "$rc" -ne 0 ]; then
+          if [ "$first_rc" -ne 0 ]; then
             unresolved="$(git diff --name-only --diff-filter=U)"
             test "$unresolved" = "apps/desktop/electron/preload.ts"
             git checkout --ours apps/desktop/electron/preload.ts
@@ -38,8 +39,7 @@ jobs:
           from pathlib import Path
           path = Path("apps/desktop/electron/preload.ts")
           text = path.read_text(encoding="utf-8")
-          marker = """  onOpenUpdatesRequested: callback => {
-          """
+          marker = "  onOpenUpdatesRequested: callback => {\n"
           block = """  onUpdateAllRequested: callback => {
               const listener = (_event, id: string) => {
                 void Promise.resolve()
@@ -64,7 +64,55 @@ jobs:
             GIT_EDITOR=true git cherry-pick --continue
           fi
 
+          set +e
           git cherry-pick bf5e23088226a9b49ff4ef14063f9fa39f771fe4
+          second_rc=$?
+          set -e
+          if [ "$second_rc" -ne 0 ]; then
+            unresolved="$(git diff --name-only --diff-filter=U | sort)"
+            expected="$(printf '%s\n' apps/desktop/electron/main.ts apps/desktop/electron/preload.ts | sort)"
+            test "$unresolved" = "$expected"
+
+            # Both conflicts are upstream churn around code this commit also
+            # formatted. Keep current main, then replay only the two semantic
+            # fixes from the commit.
+            git checkout --ours apps/desktop/electron/main.ts apps/desktop/electron/preload.ts
+            python - <<'PY'
+          from pathlib import Path
+
+          path = Path("apps/desktop/electron/main.ts")
+          text = path.read_text(encoding="utf-8")
+
+          loading = "  mainWindow.webContents.on('did-start-loading', () => updateAllLaunch.rendererGone())\n"
+          gone = "  mainWindow.webContents.on('render-process-gone', () => updateAllLaunch.rendererGone())\n"
+          if gone not in text:
+              if loading not in text:
+                  raise SystemExit("rendererGone insertion marker moved")
+              text = text.replace(loading, loading + gone, 1)
+
+          old = """    const updateRequest = typeof additionalData?.updateAllRequest === 'string'
+                ? additionalData.updateAllRequest
+                : takeUpdateAllLaunchArg(argv)
+          """
+          new = """    const updateRequest =
+                additionalData &&
+                typeof additionalData === 'object' &&
+                'updateAllRequest' in additionalData &&
+                typeof additionalData.updateAllRequest === 'string'
+                  ? additionalData.updateAllRequest
+                  : takeUpdateAllLaunchArg(argv)
+          """
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif "'updateAllRequest' in additionalData" not in text:
+              raise SystemExit("second-instance update request guard moved")
+
+          path.write_text(text, encoding="utf-8")
+          PY
+            git add apps/desktop/electron/main.ts apps/desktop/electron/preload.ts
+            GIT_EDITOR=true git cherry-pick --continue
+          fi
+
           git cherry-pick 919c5368037e605560f4d0996cc605ce31081800
           git diff upstream/main...HEAD --check
           echo "REBASING_ON=$(git rev-parse upstream/main)" >> "$GITHUB_ENV"
