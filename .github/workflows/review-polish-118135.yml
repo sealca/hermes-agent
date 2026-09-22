@@ -1,4 +1,4 @@
-name: Review polish 118135
+name: Rebase probe 118135
 
 on:
   push:
@@ -8,22 +8,21 @@ permissions:
   contents: read
 
 jobs:
-  focused:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  rebase-probe:
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
         with:
-          version: '0.9.28'
-      - run: uv sync --locked --python 3.11 --extra all --extra dev
-      - name: Focused handoff tests
+          fetch-depth: 0
+      - name: Cherry-pick feature onto current upstream main
         shell: bash
-        run: scripts/run_tests.sh tests/hermes_cli/test_desktop_update_request.py -q
-      - name: Ruff
-        shell: bash
-        run: uv run --no-sync ruff check hermes_cli/desktop_update_request.py tests/hermes_cli/test_desktop_update_request.py
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+          git checkout --detach upstream/main
+          git cherry-pick 1c8292d3c9780092c511da81ca2b66ddf8397777
+          git cherry-pick bf5e23088226a9b49ff4ef14063f9fa39f771fe4
+          git cherry-pick 919c5368037e605560f4d0996cc605ce31081800
+          git diff upstream/main...HEAD --check
+          git log --oneline -4
