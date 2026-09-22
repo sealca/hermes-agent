@@ -1,28 +1,97 @@
-name: Rebase probe 118135
+name: Rebase and validate 118135
 
 on:
   push:
     branches: [ci/review-polish-118135]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  rebase-probe:
+  rebase-validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+    env:
+      NODE_OPTIONS: --max-old-space-size=6144
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-      - name: Cherry-pick feature onto current upstream main
+      - name: Rebase feature commits onto current upstream main
         shell: bash
         run: |
+          git config user.name "Sealcadev"
+          git config user.email "100358515+sealca@users.noreply.github.com"
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
           git fetch upstream main
           git checkout --detach upstream/main
+
+          set +e
           git cherry-pick 1c8292d3c9780092c511da81ca2b66ddf8397777
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            unresolved="$(git diff --name-only --diff-filter=U)"
+            test "$unresolved" = "apps/desktop/electron/preload.ts"
+            git checkout --ours apps/desktop/electron/preload.ts
+            python - <<'PY'
+          from pathlib import Path
+          path = Path("apps/desktop/electron/preload.ts")
+          text = path.read_text(encoding="utf-8")
+          marker = """  onOpenUpdatesRequested: callback => {
+          """
+          block = """  onUpdateAllRequested: callback => {
+              const listener = (_event, id: string) => {
+                void Promise.resolve()
+                  .then(callback)
+                  .finally(() => ipcRenderer.invoke('hermes:update-all-complete', id))
+                  .catch(error => console.error('[updates] update-all request failed:', error))
+              }
+
+              ipcRenderer.on('hermes:update-all-requested', listener)
+              void ipcRenderer.invoke('hermes:update-all-ready')
+
+              return () => ipcRenderer.removeListener('hermes:update-all-requested', listener)
+            },
+          """
+          if "onUpdateAllRequested:" in text:
+              raise SystemExit("update-all preload bridge unexpectedly already present")
+          if marker not in text:
+              raise SystemExit("preload insertion marker moved")
+          path.write_text(text.replace(marker, block + marker, 1), encoding="utf-8")
+          PY
+            git add apps/desktop/electron/preload.ts
+            GIT_EDITOR=true git cherry-pick --continue
+          fi
+
           git cherry-pick bf5e23088226a9b49ff4ef14063f9fa39f771fe4
           git cherry-pick 919c5368037e605560f4d0996cc605ce31081800
           git diff upstream/main...HEAD --check
-          git log --oneline -4
+          echo "REBASING_ON=$(git rev-parse upstream/main)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26
+          cache: npm
+      - run: npm ci
+      - name: Desktop focused tests
+        working-directory: apps/desktop
+        run: |
+          npx vitest run --maxWorkers=2 electron/update-all-launch.test.ts src/store/update-all-launch.test.ts src/store/updates.test.ts src/app/contrib/hooks/use-desktop-integrations.test.tsx
+          npm run typecheck
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: '0.9.28'
+      - run: uv sync --locked --python 3.11 --extra all --extra dev
+      - name: Python focused tests
+        shell: bash
+        run: |
+          scripts/run_tests.sh tests/hermes_cli/test_desktop_update_request.py tests/hermes_cli/test_gui_command.py tests/hermes_cli/test_desktop_startup_cost.py tests/hermes_cli/test_desktop_local_flag.py tests/hermes_cli/test_subcommands_batch.py -q
+          uv run --no-sync ruff check hermes_cli/desktop_update_request.py tests/hermes_cli/test_desktop_update_request.py
+
+      - name: Publish rebased feature branch
+        shell: bash
+        run: |
+          git push --force-with-lease=refs/heads/feat/desktop-update-all:919c5368037e605560f4d0996cc605ce31081800 \
+            origin HEAD:refs/heads/feat/desktop-update-all
