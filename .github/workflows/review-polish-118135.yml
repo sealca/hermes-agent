@@ -1,4 +1,4 @@
-name: Recover PR 118135 - validate
+name: Recover PR 118135 - final validation
 
 on:
   push:
@@ -11,6 +11,8 @@ jobs:
   recover:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    outputs:
+      candidate: ${{ steps.publish.outputs.candidate }}
     env:
       OLD_HEAD: 58e9822445a468c155bc070e61aef170a0469071
       OLD_BASE: fde4997f580c3480798fdf9c7e92c0079d6e03d6
@@ -21,7 +23,7 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
-      - name: Replay the reviewed commit and resolve only observed conflicts
+      - name: Replay reviewed code and adapt only upstream conflicts and test APIs
         shell: bash
         run: |
           set -euo pipefail
@@ -41,18 +43,15 @@ jobs:
           from pathlib import Path
           import re
           import subprocess
-
           main = 'apps/desktop/electron/main.ts'
           hook = 'apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts'
           cli = 'hermes_cli/main_desktop.py'
           actual = subprocess.check_output(['git', 'diff', '--name-only', '--diff-filter=U'], text=True).splitlines()
           assert sorted(actual) == sorted([main, hook, cli]), actual
           conflicts = re.compile(r'^<<<<<<< HEAD\n(.*?)^=======\n(.*?)^>>>>>>>[^\n]*\n', re.M | re.S)
-
           path = Path(main)
           text = path.read_text()
-          matches = list(conflicts.finditer(text))
-          assert len(matches) == 2
+          assert len(conflicts.findall(text)) == 2
           def resolve_main(match):
               ours, theirs = match.groups()
               assert not ours.strip()
@@ -69,17 +68,14 @@ jobs:
           assert text.count('app.requestSingleInstanceLock(') == 1
           assert "from './update-api-check'" not in text
           path.write_text(text)
-
           path = Path(hook)
           text = path.read_text()
           assert len(conflicts.findall(text)) == 1
           def resolve_hook(match):
               ours, theirs = match.groups()
-              assert 'requestSkillInstallFromDeepLink' in ours
-              assert 'updateAllFromLauncher' in theirs
+              assert 'requestSkillInstallFromDeepLink' in ours and 'updateAllFromLauncher' in theirs
               return ours + theirs
           path.write_text(conflicts.sub(resolve_hook, text))
-
           path = Path(cli)
           text = path.read_text()
           assert len(conflicts.findall(text)) == 1
@@ -90,14 +86,35 @@ jobs:
               assert 'bundled = is_bundled_payload(PROJECT_ROOT)' in ours
               return theirs[:-len(old_guard)] + ours
           path.write_text(conflicts.sub(resolve_cli, text))
+          # Keep all existing assertions; only adapt renamed/moved upstream seams.
+          path = Path('tests/hermes_cli/test_desktop_update_request.py')
+          text = path.read_text()
+          replacements = {
+              '"_build_desktop_app", build_forbidden': '"build_prepared_desktop", build_forbidden',
+              'pytest.mark.linux_only': 'pytest.mark.platforms("linux")',
+              'pytest.mark.macos_only': 'pytest.mark.platforms("macos")',
+              'pytest.mark.windows_only': 'pytest.mark.platforms("windows")',
+          }
+          for old, new in replacements.items():
+              assert text.count(old) == 1, old
+              text = text.replace(old, new)
+          path.write_text(text)
+          path = Path('apps/desktop/e2e/update-all-launch.spec.ts')
+          text = path.read_text()
+          old = "import { startMockServer } from '../../../tests-js/scripts/mock-server'"
+          assert text.count(old) == 1
+          text = text.replace(old, "import { writeEnvFile, writeMockProviderConfig } from '../../../tests-js/scripts/mock-provider-config'\n" + old)
+          old = "import { buildAppEnv, createSandbox, findElectron, writeEnvFile, writeMockProviderConfig } from './fixtures'"
+          assert text.count(old) == 1
+          text = text.replace(old, "import { buildAppEnv, createSandbox, findElectron } from './fixtures'")
+          path.write_text(text)
           PY
-          git add apps/desktop/electron/main.ts apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts hermes_cli/main_desktop.py
+          git add apps/desktop/electron/main.ts apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts hermes_cli/main_desktop.py tests/hermes_cli/test_desktop_update_request.py apps/desktop/e2e/update-all-launch.spec.ts
           git diff --cached --check
           git -c commit.gpgsign=false commit -C "$OLD_HEAD"
           git diff --name-only "$OLD_BASE" "$OLD_HEAD" | sort > /tmp/expected-files
           git diff --name-only "$NEW_BASE" HEAD | sort > /tmp/actual-files
           diff -u /tmp/expected-files /tmp/actual-files
-          git diff "$NEW_BASE" HEAD --check
           git diff --stat "$NEW_BASE" HEAD
           git range-diff "$OLD_BASE..$OLD_HEAD" "$NEW_BASE..HEAD" > /tmp/recovery-evidence/range-diff.txt
           cat /tmp/recovery-evidence/range-diff.txt
@@ -106,8 +123,7 @@ jobs:
             mkdir -p "/tmp/recovery-evidence/source/$(dirname "$file")"
             cp "$file" "/tmp/recovery-evidence/source/$file"
           done < /tmp/actual-files
-          git ls-files 'tests/*desktop*' 'tests/hermes_cli/*desktop*' > /tmp/recovery-evidence/python-test-paths.txt
-      - name: Prepare the current locked Python and Node toolchain
+      - name: Prepare current locked Python and Node
         uses: ./.github/actions/setup-pm
         with:
           toolchain: all
@@ -120,13 +136,12 @@ jobs:
           set -euo pipefail
           mapfile -t paths < <(git ls-files 'tests/hermes_cli/test_desktop*.py' 'tests/hermes_cli/test_main_desktop*.py' 'tests/test_main_desktop*.py')
           test "${#paths[@]}" -gt 0
-          printf '%s\n' "${paths[@]}"
           scripts/run_tests.sh -j 2 "${paths[@]}" --file-retries 0 2>&1 | tee /tmp/recovery-evidence/python-tests.log
       - name: Install committed JavaScript dependencies
         id: npm
         if: ${{ !cancelled() }}
         run: npm ci --no-audit --no-fund
-      - name: Desktop update and launcher regression tests
+      - name: Existing desktop update and launcher regressions
         id: unit
         if: ${{ !cancelled() && steps.npm.outcome == 'success' }}
         working-directory: apps/desktop
@@ -141,6 +156,14 @@ jobs:
         run: |
           set -euo pipefail
           npm run typecheck --workspace apps/desktop 2>&1 | tee /tmp/recovery-evidence/typecheck.log
+      - name: Lint changed TypeScript files
+        id: lint
+        if: ${{ !cancelled() && steps.npm.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t paths < <(git diff --name-only "$NEW_BASE" HEAD | grep -E '\.tsx?$')
+          npx eslint "${paths[@]}" --max-warnings=0 2>&1 | tee /tmp/recovery-evidence/lint.log
       - name: Build real Desktop
         id: build
         if: ${{ !cancelled() && steps.npm.outcome == 'success' }}
@@ -156,7 +179,8 @@ jobs:
         run: |
           set -euo pipefail
           xvfb-run -a npx playwright test e2e/update-all-launch.spec.ts --repeat-each=3 --workers=1 --retries=0 --reporter=line 2>&1 | tee /tmp/recovery-evidence/e2e.log
-      - name: Publish validated candidate only, never the PR branch
+      - name: Publish candidate only, never the PR branch
+        id: publish
         if: ${{ success() }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -175,7 +199,7 @@ jobs:
               with urllib.request.urlopen(request) as response:
                   return json.load(response)
           current = api('GET', f'/repos/{repo}/git/ref/heads/feat/desktop-update-all')
-          assert current['object']['sha'] == old, 'PR changed concurrently; refusing candidate publication'
+          assert current['object']['sha'] == old, 'PR changed concurrently'
           files = subprocess.check_output(['git','diff','--name-only',base,'HEAD'], text=True).splitlines()
           assert len(files) == 17 and not any(p.startswith('.github/') for p in files)
           base_commit = api('GET', f'/repos/{repo}/git/commits/{base}')
@@ -192,12 +216,46 @@ jobs:
           api('POST', f'/repos/{repo}/git/refs', {'ref':'refs/heads/'+branch,'sha':commit['sha']})
           manifest = {'old_head':old,'base':base,'candidate':commit['sha'],'tree':tree['sha'],'branch':branch,'run':os.environ['GITHUB_RUN_ID'],'files':files}
           Path('/tmp/recovery-evidence/candidate.json').write_text(json.dumps(manifest,indent=2))
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output:
+              output.write('candidate='+commit['sha']+'\n')
           print(json.dumps(manifest,indent=2))
           PY
-      - name: Upload diagnosis, patch and test evidence
+      - name: Upload patch and validation evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: pr-118135-recovery-evidence
           path: /tmp/recovery-evidence
+          retention-days: 7
+  native-launcher:
+    needs: recover
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.recover.outputs.candidate }}
+          persist-credentials: false
+      - name: Prepare native locked Python test environment
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '[]'
+          test-environment: 'true'
+      - name: Real native launcher handoff and CLI regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/run_tests.sh -j 1 tests/hermes_cli/test_desktop_update_request.py --file-retries 0 2>&1 | tee "$RUNNER_TEMP/native-launcher.log"
+      - name: Upload native evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-launcher-${{ matrix.os }}
+          path: ${{ runner.temp }}/native-launcher.log
           retention-days: 7
